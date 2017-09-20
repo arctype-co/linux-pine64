@@ -42,6 +42,7 @@ struct sw_uart_port {
 	unsigned char msr_saved_flags;
 	unsigned int lsr_break_flag;
 	struct sw_uart_pdata *pdata;
+	struct serial_rs485 rs485;
 
 	/* for debug */
 #define MAX_DUMP_SIZE	1024
