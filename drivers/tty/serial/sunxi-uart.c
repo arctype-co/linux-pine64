@@ -25,6 +25,7 @@
 #include <linux/slab.h>
 #include <linux/proc_fs.h>
 #include <linux/platform_device.h>
+#include <linux/uaccess.h>
 
 #include <linux/console.h>
 #include <linux/tty.h>
@@ -43,6 +44,7 @@
 #include "sunxi-uart.h"
 
 #define CONFIG_SW_UART_FORCE_LCR
+//#define CONFIG_SW_UART_PTIME_MODE
 //#define CONFIG_SW_UART_DUMP_DATA
 /*
  * ********************* Note **********************
@@ -208,11 +210,34 @@ ignore_char:
 static void sw_uart_stop_tx(struct uart_port *port)
 {
 	struct sw_uart_port *sw_uport = UART_TO_SPORT(port);
+	unsigned int lsr, usr;
+	int temt_timeout;
 
 	if (sw_uport->ier & SUNXI_UART_IER_THRI) {
-		sw_uport->ier &= ~SUNXI_UART_IER_THRI;
-		SERIAL_DBG("stop tx, ier %x\n", sw_uport->ier);
-		serial_out(port, sw_uport->ier, SUNXI_UART_IER);
+		lsr = serial_in(port, SUNXI_UART_LSR);
+		usr = serial_in(port, SUNXI_UART_USR);
+		if ((sw_uport->rs485.flags & SER_RS485_ENABLED) &&
+		    (sw_uport->rs485.flags & SER_RS485_RTS_ON_SEND)) {
+			if (usr & SUNXI_UART_USR_TFE) {
+				sw_uport->ier &= ~SUNXI_UART_IER_THRI;
+				serial_out(port, sw_uport->ier, SUNXI_UART_IER);
+				// Set RTS low when tx flushed
+				temt_timeout = 10000;
+				do {
+					udelay(1);
+					lsr = serial_in(port, SUNXI_UART_LSR);
+				} while(!(lsr & SUNXI_UART_LSR_TEMT) && (--temt_timeout > 0));
+				if (temt_timeout == 0) {
+					SERIAL_DBG("LSR TEMT timeout");
+				}
+				sw_uport->mcr |= SUNXI_UART_MCR_RTS;
+				serial_out(port, sw_uport->mcr, SUNXI_UART_MCR);
+			}
+		} else {
+			sw_uport->ier &= ~SUNXI_UART_IER_THRI;
+			serial_out(port, sw_uport->ier, SUNXI_UART_IER);
+		}
+		SERIAL_DBG("stop tx, ier %x mcr %x lsr %x usr %x\n", sw_uport->ier, sw_uport->mcr, lsr, usr);
 	}
 }
 
@@ -222,8 +247,14 @@ static void sw_uart_start_tx(struct uart_port *port)
 
 	if (!(sw_uport->ier & SUNXI_UART_IER_THRI)) {
 		sw_uport->ier |= SUNXI_UART_IER_THRI;
-		SERIAL_DBG("start tx, ier %x\n", sw_uport->ier);
 		serial_out(port, sw_uport->ier, SUNXI_UART_IER);
+		if ((sw_uport->rs485.flags & SER_RS485_ENABLED) &&
+		    (sw_uport->rs485.flags & SER_RS485_RTS_ON_SEND)) {
+			// Set RTS high
+			sw_uport->mcr &= ~SUNXI_UART_MCR_RTS;
+			serial_out(port, sw_uport->mcr, SUNXI_UART_MCR);
+		}
+		SERIAL_DBG("start tx, ier %x mcr %x\n", sw_uport->ier, sw_uport->mcr);
 	}
 }
 
@@ -883,6 +914,76 @@ static void sw_uart_pm(struct uart_port *port, unsigned int state,
 	}
 }
 
+static void sw_uart_config_rs485(struct uart_port *port, struct serial_rs485 *rs485_config)
+{
+	struct sw_uart_port *sw_uport = UART_TO_SPORT(port);
+	unsigned long irq_flags;
+
+	// Disable interrupts
+	spin_lock_irqsave(&port->lock, irq_flags);
+
+	// Revert unsupported bits
+	rs485_config->flags &= ~(SER_RS485_RTS_AFTER_SEND|SER_RS485_RX_DURING_TX);
+	sw_uport->rs485 = *rs485_config;
+
+	if (rs485_config->flags & SER_RS485_ENABLED) {
+		dev_dbg(port->dev, "Setting UART to RS485, flags %x\n", rs485_config->flags);
+		// Disable auto flow control, set RTS low
+		sw_uport->mcr &= ~SUNXI_UART_MCR_AFE;
+		sw_uport->mcr |= SUNXI_UART_MCR_RTS;
+
+		#ifdef CONFIG_SW_UART_PTIME_MODE
+		if (rs485_config->flags & SER_RS485_RTS_ON_SEND) {
+			// Trigger TX stop only when FIFO is completely empty.
+			sw_uport->fcr &= ~SUNXI_UART_FCR_TXTRG_MASK;
+			sw_uport->fcr |= SUNXI_UART_FCR_TXTRG_EMP;
+		}
+		else {
+			sw_uport->fcr &= ~SUNXI_UART_FCR_TXTRG_MASK;
+			sw_uport->fcr |= SUNXI_UART_FCR_TXTRG_1_2;
+		}
+		#endif
+	} else {
+		dev_dbg(port->dev, "Setting UART to RS232\n");
+		#ifdef CONFIG_SW_UART_PTIME_MODE
+		// Reset TX FIFO empty interrupt
+		sw_uport->fcr &= ~SUNXI_UART_FCR_TXTRG_MASK;
+		sw_uport->fcr |= SUNXI_UART_FCR_TXTRG_1_2;
+		#endif
+	}
+
+	SERIAL_DBG("set mcr %x fcr %x\n", sw_uport->mcr, sw_uport->fcr);
+	serial_out(port, sw_uport->mcr, SUNXI_UART_MCR);
+	serial_out(port, sw_uport->fcr, SUNXI_UART_FCR);
+
+	// Enable interrupts
+	spin_unlock_irqrestore(&port->lock, irq_flags);
+}
+
+static int sw_uart_ioctl(struct uart_port *port, unsigned int cmd, unsigned long arg)
+{
+	struct sw_uart_port *sw_uport = UART_TO_SPORT(port);
+	struct serial_rs485 rs485conf;
+
+	switch (cmd) {
+	case TIOCSRS485:
+		if (copy_from_user(&rs485conf, (struct serial_rs485 *) arg, sizeof(rs485conf)))
+			return -EFAULT;
+
+		sw_uart_config_rs485(port, &rs485conf);
+		break;
+
+	case TIOCGRS485:
+		if (copy_to_user((struct serial_rs485 *) arg, &(sw_uport->rs485), sizeof(rs485conf)))
+			return -EFAULT;
+		break;
+
+	default:
+		return -ENOIOCTLCMD;
+	}
+	return 0;
+}
+
 static struct uart_ops sw_uart_ops = {
 	.tx_empty = sw_uart_tx_empty,
 	.set_mctrl = sw_uart_set_mctrl,
@@ -902,6 +1003,7 @@ static struct uart_ops sw_uart_ops = {
 	.config_port = sw_uart_config_port,
 	.verify_port = sw_uart_verify_port,
 	.pm = sw_uart_pm,
+	.ioctl = sw_uart_ioctl,
 };
 
 static int sw_uart_regulator_request(struct sw_uart_port* sw_uport, struct sw_uart_pdata *pdata)
@@ -1274,6 +1376,10 @@ static int sw_uart_probe(struct platform_device *pdev)
 	sw_uport->fcr = 0;
 	sw_uport->dll = 0;
 	sw_uport->dlh = 0;
+	sw_uport->rs485.flags = 0;
+	sw_uport->rs485.delay_rts_before_send = 0;
+	sw_uport->rs485.delay_rts_after_send = 0;
+
 	snprintf(sw_uport->name, 16, SUNXI_UART_DEV_NAME"%d", pdev->id);
 	pdev->dev.init_name = sw_uport->name;
 	pdev->dev.platform_data = sw_uport->pdata;
